@@ -97,16 +97,15 @@ cargo bay --list
 
 - **Discovery** is a single `cargo metadata` call at startup: it yields the workspace root, the real target directory (honoring `CARGO_TARGET_DIR`), and every member's binary targets, description, and dependencies.
 - **App kind** is inferred from dependencies: a crate depending on `bevy` is treated as *windowed* (its logs stream to a panel); everything else is *terminal* (it gets the real TTY).
-- **Freshness** is a fast mtime heuristic: an app is *stale* if any `.rs`/`Cargo.toml` under the workspace's member crates is newer than its binary. It deliberately ignores the root `Cargo.lock` so an unrelated dependency bump doesn't strand an app as permanently stale.
+- **Freshness** is a fast mtime heuristic driven by the resolved dependency graph: an app is *stale* only if any `.rs`/`Cargo.toml` in a crate it *transitively links* is newer than its binary — so editing an unrelated crate won't mark it stale. It ignores the root `Cargo.lock` so an unrelated dependency bump doesn't strand an app as permanently stale.
 
 ## Limitations
 
-- Freshness is an mtime approximation, not Cargo's content-hash fingerprint. It errs toward "stale" (safe), and currently treats an edit to *any* member crate as affecting *all* apps — narrowing this to each app's real dependency graph is on the roadmap.
+- Freshness is an mtime approximation, not Cargo's content-hash fingerprint. It errs toward "stale" (safe): a touched-but-unchanged source file can still read as stale.
 - One binary target per package is listed (the first one found).
 
 ## Roadmap
 
-- Per-app dependency-graph freshness (only mark an app stale when a crate it actually links changes).
 - Optional cached index for very large workspaces.
 - Optional `.cargo-bay.toml` for include/exclude curation.
 

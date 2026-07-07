@@ -1,6 +1,6 @@
 [package]
 name = "cargo-bay"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Borna Cvitanić <borna.cvitanic@gmail.com>"]
 description = "A terminal UI to browse, run, and rebuild every binary in a Cargo workspace."
 repository = "https://github.com/bornacvitanic/cargo-bay"

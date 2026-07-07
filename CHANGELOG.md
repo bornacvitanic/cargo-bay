@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-07-07
+
+### Documentation
+
+- Add cliff.toml and CHANGELOG.md (git-cliff)
+
+### Features
+
+- Add per-app dependency-graph freshness
+
+Use the resolved dependency graph from cargo metadata (drop --no-deps) to mark
+an app stale only when a crate it transitively links has newer source than its
+binary, instead of treating any member edit as affecting all apps. Falls back
+to the all-members comparison if the resolve graph is unavailable.
+
 ## [0.1.0] - 2026-07-07
 
 ### Bug Fixes

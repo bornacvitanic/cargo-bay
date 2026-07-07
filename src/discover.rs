@@ -3,12 +3,17 @@
 //!
 //! One `cargo metadata` call yields the workspace root, the real target dir
 //! (honoring CARGO_TARGET_DIR), every member package, its binary targets,
-//! description, and dependencies (for the windowed/terminal split). We split
-//! discovery into two steps: [`discover`] runs cargo once to build a static
-//! [`Catalog`]; [`resolve`] is pure filesystem work (prebuilt lookup + mtime
-//! freshness) and is cheap to re-run after every build.
+//! description, dependencies (for the windowed/terminal split), and the
+//! resolved dependency graph. We split discovery into two steps: [`discover`]
+//! runs cargo once to build a static [`Catalog`]; [`resolve`] is pure
+//! filesystem work (prebuilt lookup + mtime freshness) and is cheap to re-run
+//! after every build.
+//!
+//! Freshness is per-app: an app is stale only when a crate it actually links
+//! (its transitive workspace-member dependencies) has source newer than the
+//! app's binary — so editing an unrelated crate doesn't mark it stale.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -83,13 +88,20 @@ pub enum Freshness {
 pub struct Catalog {
     pub root: PathBuf,
     target_dir: PathBuf,
-    /// Source dirs of every member (for the shared-source freshness check).
-    member_dirs: Vec<PathBuf>,
     metas: Vec<AppMeta>,
+    /// Every workspace member's source dir, keyed by package id.
+    member_dirs: HashMap<String, PathBuf>,
+    /// Member → its transitive workspace-member dependencies (incl. itself).
+    /// Empty when the resolve graph is unavailable (see `dep_graph`).
+    closures: HashMap<String, HashSet<String>>,
+    /// Whether we have a real dependency graph. When false, freshness falls
+    /// back to comparing against every member's source (safe over-approx).
+    dep_graph: bool,
     prefer_release: bool,
 }
 
 struct AppMeta {
+    id: String,
     name: String,
     bin: String,
     description: String,
@@ -131,6 +143,7 @@ struct Metadata {
     workspace_members: Vec<String>,
     workspace_root: String,
     target_directory: String,
+    resolve: Option<Resolve>,
 }
 
 #[derive(Deserialize)]
@@ -156,10 +169,36 @@ struct Dependency {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct Resolve {
+    nodes: Vec<Node>,
+}
+
+#[derive(Deserialize)]
+struct Node {
+    id: String,
+    #[serde(default)]
+    deps: Vec<NodeDep>,
+}
+
+#[derive(Deserialize)]
+struct NodeDep {
+    pkg: String,
+    #[serde(default)]
+    dep_kinds: Vec<DepKind>,
+}
+
+#[derive(Deserialize)]
+struct DepKind {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
 /// Run cargo once and build the static catalogue.
 pub fn discover(cfg: &Config) -> Result<Catalog, DiscoverError> {
     let mut cmd = Command::new("cargo");
-    cmd.args(["metadata", "--format-version", "1", "--no-deps"]);
+    // No `--no-deps`: we want the resolved graph for per-app freshness.
+    cmd.args(["metadata", "--format-version", "1"]);
     if let Some(mp) = &cfg.manifest_path {
         cmd.arg("--manifest-path").arg(mp);
     }
@@ -182,22 +221,30 @@ pub fn discover(cfg: &Config) -> Result<Catalog, DiscoverError> {
     let target_dir = PathBuf::from(&meta.target_directory);
     let sub_root = cfg.subfolder.as_ref().map(|s| root.join(s));
 
-    let mut member_dirs = Vec::new();
+    // Every member's source dir, keyed by id (for the per-member mtime walk).
+    let mut member_dirs = HashMap::new();
+    for p in &meta.packages {
+        if members.contains(p.id.as_str()) {
+            let dir = Path::new(&p.manifest_path)
+                .parent()
+                .unwrap_or(&root)
+                .to_path_buf();
+            member_dirs.insert(p.id.clone(), dir);
+        }
+    }
+
+    // Member → transitive member-dependency closure (incl. self).
+    let (closures, dep_graph) = build_closures(&meta.resolve, &members);
+
     let mut metas = Vec::new();
     for p in &meta.packages {
         if !members.contains(p.id.as_str()) {
             continue;
         }
-        let dir = Path::new(&p.manifest_path)
-            .parent()
-            .unwrap_or(&root)
-            .to_path_buf();
-        // Every member dir feeds the freshness check, even lib-only ones.
-        member_dirs.push(dir.clone());
-
         let Some(bin) = p.targets.iter().find(|t| t.kind.iter().any(|k| k == "bin")) else {
             continue; // lib-only member — not runnable
         };
+        let dir = &member_dirs[&p.id];
         if let Some(sr) = &sub_root {
             if !dir.starts_with(sr) {
                 continue;
@@ -214,6 +261,7 @@ pub fn discover(cfg: &Config) -> Result<Catalog, DiscoverError> {
             AppKind::Terminal
         };
         metas.push(AppMeta {
+            id: p.id.clone(),
             name: p.name.clone(),
             bin: bin.name.clone(),
             description: p.description.clone().unwrap_or_default(),
@@ -225,19 +273,89 @@ pub fn discover(cfg: &Config) -> Result<Catalog, DiscoverError> {
     Ok(Catalog {
         root,
         target_dir,
-        member_dirs,
         metas,
+        member_dirs,
+        closures,
+        dep_graph,
         prefer_release: cfg.prefer_release,
     })
+}
+
+/// Build each member's transitive workspace-member dependency set (incl.
+/// itself), skipping dev-only edges (they don't affect the built binary).
+/// Returns `(closures, true)` on success, or `(empty, false)` if the resolve
+/// graph is missing — the caller then over-approximates against all members.
+fn build_closures(
+    resolve: &Option<Resolve>,
+    members: &HashSet<&str>,
+) -> (HashMap<String, HashSet<String>>, bool) {
+    let Some(resolve) = resolve else {
+        return (HashMap::new(), false);
+    };
+
+    // Direct member-dependency edges between workspace members.
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in &resolve.nodes {
+        if !members.contains(node.id.as_str()) {
+            continue;
+        }
+        let deps = node
+            .deps
+            .iter()
+            .filter(|d| members.contains(d.pkg.as_str()))
+            // Keep a dep unless it is used *only* as a dev-dependency.
+            .filter(|d| {
+                d.dep_kinds.is_empty()
+                    || d.dep_kinds.iter().any(|k| k.kind.as_deref() != Some("dev"))
+            })
+            .map(|d| d.pkg.as_str())
+            .collect();
+        edges.insert(node.id.as_str(), deps);
+    }
+
+    let mut closures = HashMap::new();
+    for &start in members {
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::from([start]);
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            if let Some(neighbours) = edges.get(id) {
+                queue.extend(neighbours.iter().copied());
+            }
+        }
+        closures.insert(start.to_string(), seen);
+    }
+    (closures, true)
 }
 
 /// Filesystem-only pass: resolve each app's prebuilt binaries and freshness.
 /// Safe and cheap to call after every build.
 pub fn resolve(cat: &Catalog) -> Vec<AppEntry> {
-    let src_newest = newest_mtime_in(&cat.member_dirs);
+    // Newest source mtime per member crate.
+    let member_newest: HashMap<&str, Option<SystemTime>> = cat
+        .member_dirs
+        .iter()
+        .map(|(id, dir)| (id.as_str(), newest_mtime_in(std::slice::from_ref(dir))))
+        .collect();
+
+    // Fallback bound used when we have no dependency graph.
+    let all_newest = member_newest.values().copied().flatten().max();
+
     cat.metas
         .iter()
         .map(|m| {
+            let src_newest = if cat.dep_graph {
+                cat.closures
+                    .get(&m.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| member_newest.get(id.as_str()).copied().flatten())
+                    .max()
+            } else {
+                all_newest
+            };
             let (launch, prebuilts) =
                 resolve_launch(&cat.target_dir, &m.bin, src_newest, cat.prefer_release);
             AppEntry {
