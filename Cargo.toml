@@ -1,0 +1,24 @@
+[package]
+name = "cargo-bay"
+version = "0.1.0"
+authors = ["Borna Cvitanić <borna.cvitanic@gmail.com>"]
+description = "A terminal UI to browse, run, and rebuild every binary in a Cargo workspace."
+repository = "https://github.com/bornacvitanic/cargo-bay"
+license = "MIT"
+edition = "2021"
+readme = "README.md"
+keywords = ["tui", "cargo", "workspace", "runner", "launcher"]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "development-tools::cargo-plugins",
+]
+
+[dependencies]
+# Terminal UI widgets + layout.
+ratatui = "0.29"
+# Cross-platform terminal control (raw mode, alt-screen, mouse, events).
+crossterm = "0.28"
+# Deserialize `cargo metadata` JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
