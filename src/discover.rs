@@ -280,7 +280,7 @@ fn resolve_launch(
             })
         })
         .collect();
-    prebuilts.sort_by(|a, b| b.mtime.cmp(&a.mtime)); // newest first
+    prebuilts.sort_by_key(|p| std::cmp::Reverse(p.mtime)); // newest first
 
     let default = if prefer_release {
         prebuilts
