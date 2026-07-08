@@ -45,7 +45,11 @@ pub enum AppKind {
 /// The default (fast) launch for an app.
 pub enum Launch {
     /// A prebuilt binary exists — run it directly (instant, no compile).
-    Prebuilt { path: PathBuf, freshness: Freshness },
+    Prebuilt {
+        path: PathBuf,
+        freshness: Freshness,
+        kind: BinKind,
+    },
     /// No binary yet — Enter falls back to `cargo run`.
     BuildOnly,
 }
@@ -59,7 +63,7 @@ pub struct Prebuilt {
 }
 
 /// Which build of a binary a `Prebuilt` refers to.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BinKind {
     /// `cargo install`ed into `~/.cargo/bin` — the "published" copy.
     Installed,
@@ -412,6 +416,7 @@ fn resolve_launch(
         Some(pb) => Launch::Prebuilt {
             path: pb.path.clone(),
             freshness: pb.freshness,
+            kind: pb.kind,
         },
         None => Launch::BuildOnly,
     };

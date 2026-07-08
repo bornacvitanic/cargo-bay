@@ -2,7 +2,7 @@
 //! selected app's description — or the live log console — on the right; a
 //! key-hint + build-summary footer; and a modal version-picker overlay.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -59,11 +59,19 @@ pub fn draw(frame: &mut Frame, launcher: &mut Launcher) {
         .apps
         .iter()
         .map(|a| {
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 list_tag(a, &launcher.jobs, launcher.tick),
                 Span::raw(" "),
                 Span::raw(a.name.clone()),
-            ]))
+            ];
+            // The profile Enter will run, so the fast path is never a mystery.
+            if let Launch::Prebuilt { kind, .. } = &a.launch {
+                spans.push(Span::styled(
+                    format!("  ·{}", kind.label()),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)
@@ -155,16 +163,20 @@ fn detail(launcher: &Launcher) -> Paragraph<'static> {
 /// Human sentence describing what Enter / left-click will do for this app.
 fn run_line(app: &AppEntry) -> Span<'static> {
     match &app.launch {
-        Launch::Prebuilt { path, freshness } => {
+        Launch::Prebuilt {
+            path,
+            freshness,
+            kind,
+        } => {
             let (note, color) = match freshness {
                 Freshness::Stale => (
-                    "  (stale — b / right-click for other versions, r to rebuild)",
+                    "  (stale — Enter runs it as-is · b then f rebuilds + runs)",
                     Color::Yellow,
                 ),
                 Freshness::Fresh => ("  (fresh)", Color::Green),
             };
             Span::styled(
-                format!("{}{note}", path.display()),
+                format!("{}  {}{note}", kind.label(), path.display()),
                 Style::default().fg(color),
             )
         }
@@ -184,9 +196,11 @@ fn footer(launcher: &Launcher) -> Paragraph<'static> {
     };
     let mut spans: Vec<Span> = if matches!(launcher.screen, Screen::List) {
         [
-            hint("Enter/click", "run"),
+            hint("Enter", "run"),
+            hint("r", "release"),
+            hint("d", "debug"),
             hint("b", "versions"),
-            hint("r", "rebuild stale"),
+            hint("R", "rebuild"),
             hint("l", "log"),
             hint("x", "cancel"),
             hint("q", "quit"),
@@ -195,8 +209,9 @@ fn footer(launcher: &Launcher) -> Paragraph<'static> {
     } else {
         [
             hint("up/down", "move"),
-            hint("Enter/click", "run this version"),
-            hint("Esc/right-click", "cancel"),
+            hint("Enter/click", "run as-is"),
+            hint("f", "rebuild + run"),
+            hint("Esc", "back"),
         ]
         .concat()
     };
@@ -227,4 +242,32 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// The pre-launch splash shown while `cargo metadata` runs on a worker thread,
+/// so a big workspace never greets the user with a blank terminal.
+pub fn draw_loading(frame: &mut Frame, tick: u64) {
+    let area = centered(frame.area(), 46, 5);
+    frame.render_widget(Clear, area);
+    let sp = crate::job::spinner(tick);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "⚓ freight",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · cargo-bay", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{sp}  scanning the workspace…"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered())
+            .alignment(Alignment::Center),
+        area,
+    );
 }

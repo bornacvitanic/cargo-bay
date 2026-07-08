@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Config {
     /// Point cargo metadata at a specific workspace instead of the cwd.
     pub manifest_path: Option<PathBuf>,
@@ -38,10 +39,12 @@ OPTIONS:
     -h, --help            Show this help
 
 TUI KEYS:
-    up/down · j/k · wheel  move      Enter / click        run
-    b / right-click        versions  r                    rebuild stale (background)
-    l                      log       x                    cancel builds
-    PgUp / PgDn            scroll    q / Esc              quit
+    up/down · j/k · wheel  move            Enter / click  run newest build as-is
+    r                      run release     d              run debug
+    b / right-click        version picker  (Enter runs as-is · f rebuilds + runs)
+    R                      rebuild stale   x              cancel builds
+    l                      log             PgUp / PgDn    scroll
+    q / Esc                quit
 ";
 
 pub fn usage() -> &'static str {

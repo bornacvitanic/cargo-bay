@@ -4,10 +4,12 @@
 //! subcommand) or directly as `cargo-bay`.
 //!
 //!   up/down · j/k · wheel   move
-//!   Enter · left-click       run (windowed apps stream to the log panel;
-//!                            terminal apps take over the screen)
-//!   b · right-click          version picker (installed / release / debug / rebuild)
-//!   r                        rebuild every not-fresh app (dev), in the background
+//!   Enter · left-click       run the newest build as-is (even if stale;
+//!                            windowed apps log to the panel, terminal apps
+//!                            take over the screen)
+//!   r · d                    run release · run debug (as-is; build if absent)
+//!   b · right-click          version picker (Enter runs as-is; f rebuilds + runs)
+//!   R                        rebuild every not-fresh app (dev), in the background
 //!   l                        toggle the log console      x  cancel builds
 //!   PgUp/PgDn                scroll the log              q / Esc  quit
 
@@ -19,11 +21,12 @@ mod ui;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -35,7 +38,7 @@ use ratatui::widgets::ListState;
 use ratatui::Terminal;
 
 use cli::Cli;
-use discover::{discover, resolve, AppEntry, AppKind, Catalog, Launch};
+use discover::{discover, resolve, AppEntry, AppKind, BinKind, Catalog, Launch};
 use job::Jobs;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -46,7 +49,11 @@ const TICK: Duration = Duration::from_millis(100);
 /// One selectable line in the version picker.
 pub struct RunChoice {
     pub label: String,
+    /// What Enter on this row does — run the prebuilt as-is, or build + run.
     pub action: RunAction,
+    /// The profile this row targets, so `f` can force-rebuild it. `None` for
+    /// rows that can't be rebuilt in place (the installed copy).
+    pub profile: Option<BinKind>,
 }
 
 /// What a picker choice does when confirmed.
@@ -149,33 +156,55 @@ impl Launcher {
         self.status = format!("queued {} build(s)", names.len());
     }
 
+    /// Build the version picker: one row per profile. If a profile's binary
+    /// exists, Enter runs it as-is (even stale); if not, Enter builds + runs it.
+    /// `f` on any release/debug row forces a rebuild first. The installed copy
+    /// is run-only (we don't reinstall it).
     fn open_run_picker(&mut self) {
         let Some(app) = self.selected() else {
             return;
         };
         let name = app.name.clone();
         let kind = app.kind;
-        let mut choices: Vec<RunChoice> = app
-            .prebuilts
-            .iter()
-            .map(|pb| RunChoice {
+        let prebuilt = |want: BinKind| app.prebuilts.iter().find(|p| p.kind == want);
+
+        let mut choices: Vec<RunChoice> = Vec::new();
+        for profile in [BinKind::Release, BinKind::Debug] {
+            let release = matches!(profile, BinKind::Release);
+            choices.push(match prebuilt(profile) {
+                Some(pb) => RunChoice {
+                    label: format!(
+                        "run {:<9} {}{}",
+                        profile.label(),
+                        pb.path.display(),
+                        ui::freshness_suffix(pb.freshness),
+                    ),
+                    action: RunAction::Exec(pb.path.clone()),
+                    profile: Some(profile),
+                },
+                None => RunChoice {
+                    label: format!(
+                        "build {:<7} cargo run -p {name}{}",
+                        profile.label(),
+                        if release { " --release" } else { "" },
+                    ),
+                    action: RunAction::Cargo { release },
+                    profile: Some(profile),
+                },
+            });
+        }
+        if let Some(pb) = prebuilt(BinKind::Installed) {
+            choices.push(RunChoice {
                 label: format!(
                     "run {:<9} {}{}",
-                    pb.kind.label(),
+                    BinKind::Installed.label(),
                     pb.path.display(),
                     ui::freshness_suffix(pb.freshness),
                 ),
                 action: RunAction::Exec(pb.path.clone()),
-            })
-            .collect();
-        choices.push(RunChoice {
-            label: "build dev      cargo run -p".into(),
-            action: RunAction::Cargo { release: false },
-        });
-        choices.push(RunChoice {
-            label: "build release  cargo run -p --release".into(),
-            action: RunAction::Cargo { release: true },
-        });
+                profile: Some(BinKind::Installed),
+            });
+        }
         self.screen = Screen::Run {
             app: name,
             kind,
@@ -255,10 +284,12 @@ fn print_list(apps: &[AppEntry]) {
             Launch::Prebuilt {
                 path,
                 freshness: discover::Freshness::Fresh,
+                ..
             } => ("fresh", path.display().to_string()),
             Launch::Prebuilt {
                 path,
                 freshness: discover::Freshness::Stale,
+                ..
             } => ("stale", path.display().to_string()),
             Launch::BuildOnly => ("build", format!("cargo run -p {}", app.name)),
         };
@@ -279,45 +310,132 @@ fn main() -> io::Result<()> {
         Cli::Run(cfg) => cfg,
     };
 
-    let catalog = match discover(&cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
-    let apps = resolve(&catalog);
-    if apps.is_empty() {
-        let scope = cfg
-            .subfolder
-            .as_deref()
-            .map(|s| format!(" under {s}/"))
-            .unwrap_or_default();
-        eprintln!("cargo-bay: no runnable binaries found in this workspace{scope}.");
-        return Ok(());
-    }
+    // Scriptable path: discover synchronously (no TUI) and print.
     if cfg.list {
-        print_list(&apps);
+        let catalog = match discover(&cfg) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        let apps = resolve(&catalog);
+        if apps.is_empty() {
+            eprintln!("{}", no_apps_message(&cfg));
+        } else {
+            print_list(&apps);
+        }
         return Ok(());
     }
 
+    // TUI path: open the screen immediately and discover on a worker thread, so
+    // a slow `cargo metadata` on a big workspace never leaves the user staring
+    // at a blank terminal.
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
 
-    let mut launcher = Launcher::new(apps, catalog);
-    let result = run(&mut terminal, &mut launcher);
+    let (tx, rx) = mpsc::channel::<DiscoverResult>();
+    let cfg_worker = cfg.clone();
+    std::thread::spawn(move || {
+        let outcome = discover(&cfg_worker)
+            .map(|cat| {
+                let apps = resolve(&cat);
+                (cat, apps)
+            })
+            .map_err(|e| e.to_string());
+        let _ = tx.send(outcome);
+    });
 
-    launcher.jobs.kill_all();
+    let result = match loading_loop(&mut terminal, &rx)? {
+        Loaded::Quit => Ok(()),
+        Loaded::Failed(msg) => {
+            restore(&mut terminal)?;
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+        Loaded::Ready(_, apps) if apps.is_empty() => {
+            restore(&mut terminal)?;
+            eprintln!("{}", no_apps_message(&cfg));
+            return Ok(());
+        }
+        Loaded::Ready(catalog, apps) => {
+            let mut launcher = Launcher::new(apps, catalog);
+            let r = run(&mut terminal, &mut launcher);
+            launcher.jobs.kill_all();
+            r
+        }
+    };
+
+    restore(&mut terminal)?;
+    result
+}
+
+/// Discovery handed back from the worker thread: the catalogue plus the first
+/// resolve, or a ready-to-print error message.
+type DiscoverResult = Result<(Catalog, Vec<AppEntry>), String>;
+
+/// Outcome of the pre-launch loading screen.
+enum Loaded {
+    Ready(Catalog, Vec<AppEntry>),
+    Failed(String),
+    Quit,
+}
+
+/// Show the scanning splash until discovery finishes — or the user bails.
+fn loading_loop(terminal: &mut Term, rx: &mpsc::Receiver<DiscoverResult>) -> io::Result<Loaded> {
+    let mut tick: u64 = 0;
+    loop {
+        terminal.draw(|frame| ui::draw_loading(frame, tick))?;
+
+        if event::poll(TICK)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press && is_quit(&key) {
+                    return Ok(Loaded::Quit);
+                }
+            }
+        }
+
+        match rx.try_recv() {
+            Ok(Ok((catalog, apps))) => return Ok(Loaded::Ready(catalog, apps)),
+            Ok(Err(msg)) => return Ok(Loaded::Failed(msg)),
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Ok(Loaded::Failed(
+                    "cargo-bay: discovery thread stopped unexpectedly.".into(),
+                ));
+            }
+        }
+        tick = tick.wrapping_add(1);
+    }
+}
+
+/// `q`, `Esc`, or `Ctrl-C` — bail out of the loading screen.
+fn is_quit(key: &event::KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Leave the alternate screen and hand the terminal back to the shell.
+fn restore(terminal: &mut Term) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
     )?;
-    terminal.show_cursor()?;
-    result
+    terminal.show_cursor()
+}
+
+/// The "nothing to run" message, honoring any `--subfolder` scope.
+fn no_apps_message(cfg: &cli::Config) -> String {
+    let scope = cfg
+        .subfolder
+        .as_deref()
+        .map(|s| format!(" under {s}/"))
+        .unwrap_or_default();
+    format!("cargo-bay: no runnable binaries found in this workspace{scope}.")
 }
 
 fn run(terminal: &mut Term, launcher: &mut Launcher) -> io::Result<()> {
@@ -351,7 +469,9 @@ fn handle_key(terminal: &mut Term, launcher: &mut Launcher, code: KeyCode) -> io
             KeyCode::Down | KeyCode::Char('j') => launcher.move_selection(1),
             KeyCode::Enter => launch_selected(terminal, launcher)?,
             KeyCode::Char('b') => launcher.open_run_picker(),
-            KeyCode::Char('r') => launcher.rebuild_all(),
+            KeyCode::Char('r') => run_profile(terminal, launcher, BinKind::Release)?,
+            KeyCode::Char('d') => run_profile(terminal, launcher, BinKind::Debug)?,
+            KeyCode::Char('R') => launcher.rebuild_all(),
             KeyCode::Char('l') => launcher.jobs.toggle_console(),
             KeyCode::Char('x') => launcher.jobs.cancel_builds(),
             KeyCode::PageUp => launcher.jobs.scroll(5),
@@ -364,6 +484,7 @@ fn handle_key(terminal: &mut Term, launcher: &mut Launcher, code: KeyCode) -> io
             KeyCode::Up | KeyCode::Char('k') => launcher.picker_move(-1),
             KeyCode::Down | KeyCode::Char('j') => launcher.picker_move(1),
             KeyCode::Enter => run_choice(terminal, launcher)?,
+            KeyCode::Char('f') => force_rebuild_choice(terminal, launcher)?,
             _ => {}
         }
     }
@@ -460,6 +581,50 @@ fn run_choice(terminal: &mut Term, launcher: &mut Launcher) -> io::Result<()> {
     };
     launcher.screen = Screen::List;
     dispatch(terminal, launcher, name, kind, action)
+}
+
+/// Direct profile shortcut (`r` = release, `d` = debug): run that profile's
+/// prebuilt as-is — even if stale — so a quick demo never waits on a compile.
+/// Falls back to a `cargo run` that builds it only when no such binary exists.
+fn run_profile(terminal: &mut Term, launcher: &mut Launcher, want: BinKind) -> io::Result<()> {
+    let Some(app) = launcher.selected() else {
+        return Ok(());
+    };
+    let name = app.name.clone();
+    let kind = app.kind;
+    let action = app
+        .prebuilts
+        .iter()
+        .find(|p| p.kind == want)
+        .map(|p| RunAction::Exec(p.path.clone()))
+        .unwrap_or(RunAction::Cargo {
+            release: matches!(want, BinKind::Release),
+        });
+    dispatch(terminal, launcher, name, kind, action)
+}
+
+/// `f` in the version picker: force-rebuild the highlighted profile, then run
+/// it — the explicit "yes, I want to wait for a fresh build" path.
+fn force_rebuild_choice(terminal: &mut Term, launcher: &mut Launcher) -> io::Result<()> {
+    let (name, kind, release) = {
+        let Screen::Run {
+            app,
+            kind,
+            choices,
+            sel,
+        } = &launcher.screen
+        else {
+            return Ok(());
+        };
+        let release = match choices.get(*sel).and_then(|c| c.profile) {
+            Some(BinKind::Release) => true,
+            Some(BinKind::Debug) => false,
+            _ => return Ok(()), // installed / none: nothing to rebuild in place
+        };
+        (app.clone(), *kind, release)
+    };
+    launcher.screen = Screen::List;
+    dispatch(terminal, launcher, name, kind, RunAction::Cargo { release })
 }
 
 /// Route a resolved launch: windowed apps run in the background (log panel),
