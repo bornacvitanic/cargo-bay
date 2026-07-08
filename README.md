@@ -14,12 +14,13 @@ It discovers apps at runtime with `cargo metadata`, so a single install works in
 
 ## Features
 
+- **Instant startup** — the UI opens immediately with a loading splash while `cargo metadata` runs on a background thread, so even a large workspace never greets you with a blank terminal.
 - **Zero-config discovery** — lists every workspace member with a binary target, plus its `description`, via `cargo metadata`. Add a crate and it just appears.
-- **Fast launch** — runs the newest prebuilt exe directly (`target/debug`, `target/release`, or `~/.cargo/bin`) with no compile step. Falls back to `cargo run` when there's no binary yet.
-- **Freshness at a glance** — each app is tagged `fresh` / `stale` by comparing its binary's mtime against the workspace source, so you know whether the fast launch is up to date.
-- **Version picker** — pick exactly which build to run: `installed` (your published copy), `release`, `debug`, or a fresh `cargo run` — handy for comparing versions.
-- **Background rebuild-all** — one key queues a dev build of every not-fresh app, running sequentially with per-app status spinners while the UI stays responsive. Cancel any time; nothing is left running when you quit.
-- **Live log console** — windowed (GUI) apps run in the background with their output streamed into a togglable, scrollable log panel; build output lands there too, and it auto-opens on a build failure.
+- **Fast launch, never a surprise compile** — `Enter` runs the newest prebuilt exe directly, *even if it's stale*, so a quick demo never waits on a rebuild. `r` / `d` run the release / debug build directly. It only compiles when there's no binary to run.
+- **Freshness at a glance** — each app is tagged `fresh` / `stale` by comparing its binary's mtime against the workspace source, and each row shows which profile `Enter` will run.
+- **Profile picker** — `b` opens a per-profile matrix (`release` / `debug` / `installed`): `Enter` runs a build as-is, and `f` force-rebuilds that profile *then* runs it — the explicit "yes, I'll wait for fresh" path.
+- **Background rebuild-all** — `R` queues a dev build of every not-fresh app, running sequentially with per-app status spinners while the UI stays responsive. Cancel any time; nothing is left running when you quit.
+- **Docked log console** — windowed (GUI) apps run in the background with their output streamed into a collapsible log panel docked along the bottom, so app detail stays visible; build output lands there too, and it auto-opens on a build failure.
 - **Windowed vs terminal aware** — apps that open their own window (e.g. Bevy) run in the background; full-screen terminal apps (e.g. ratatui) get the real terminal handed over, then return you to the bay on exit.
 - **Mouse + keyboard** — arrow keys/`hjkl`, wheel scroll, and left/right click all work.
 
@@ -85,17 +86,18 @@ cargo bay --list
 | Keys | Action |
 |------|--------|
 | `↑`/`↓` · `j`/`k` · wheel | move selection |
-| `Enter` · left-click | run the selected app (fast) |
-| `b` · right-click | open the version picker |
-| `r` | rebuild every not-fresh app (dev, background) |
-| `l` | toggle the log console |
+| `Enter` · left-click | run the newest build as-is (even if stale) |
+| `r` / `d` | run the release / debug build directly (build only if absent) |
+| `b` · right-click | open the profile picker (`Enter` runs as-is, `f` rebuilds + runs) |
+| `R` | rebuild every not-fresh app (dev, background) |
+| `l` | toggle the docked log console |
 | `x` | cancel running/queued builds |
 | `PgUp`/`PgDn` | scroll the log |
 | `q` · `Esc` | quit |
 
 ## How it works
 
-- **Discovery** is a single `cargo metadata` call at startup: it yields the workspace root, the real target directory (honoring `CARGO_TARGET_DIR`), and every member's binary targets, description, and dependencies.
+- **Discovery** is a single `cargo metadata` call at startup, run on a background thread behind a loading splash so the UI opens instantly: it yields the workspace root, the real target directory (honoring `CARGO_TARGET_DIR`), and every member's binary targets, description, and dependencies.
 - **App kind** is inferred from dependencies: a crate depending on `bevy` is treated as *windowed* (its logs stream to a panel); everything else is *terminal* (it gets the real TTY).
 - **Freshness** is a fast mtime heuristic driven by the resolved dependency graph: an app is *stale* only if any `.rs`/`Cargo.toml` in a crate it *transitively links* is newer than its binary — so editing an unrelated crate won't mark it stale. It ignores the root `Cargo.lock` so an unrelated dependency bump doesn't strand an app as permanently stale.
 

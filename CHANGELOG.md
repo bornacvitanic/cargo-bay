@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-07-08
+
+### Features
+
+- Add a brand header, a docked log console, and a shared theme
+
+Add a two-line header (the freight brandmark, the workspace name + app count,
+and a colour-coded status-glyph legend), dock the log console along the bottom
+as a collapsible split so the app detail stays visible while builds run, and
+route all colours and glyphs through a new theme module.
+
+### Updates
+
+- Update cargo-bay startup and run UX
+
+Discover the workspace on a background thread behind a loading splash, so a
+large `cargo metadata` no longer greets the user with a blank terminal. Rework
+running so it never triggers a surprise compile: Enter runs the newest build
+as-is (even when stale), `r`/`d` run release/debug directly, and the version
+picker becomes a per-profile matrix where Enter runs a build as-is and `f`
+force-rebuilds then runs. `R` (was `r`) now rebuilds all stale apps.
+
 ## [0.1.1] - 2026-07-07
 
 ### Documentation
