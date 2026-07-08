@@ -16,6 +16,7 @@
 mod cli;
 mod discover;
 mod job;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -86,6 +87,7 @@ pub struct Launcher {
     pub list_inner: Rect,
     pub picker_inner: Rect,
     pub detail_area: Rect,
+    pub console_area: Rect,
 }
 
 impl Launcher {
@@ -107,6 +109,7 @@ impl Launcher {
             list_inner: Rect::default(),
             picker_inner: Rect::default(),
             detail_area: Rect::default(),
+            console_area: Rect::default(),
         }
     }
 
@@ -253,6 +256,10 @@ impl Launcher {
 
     fn on_detail(&self, col: u16, row: u16) -> bool {
         contains(self.detail_area, col, row)
+    }
+
+    fn on_console(&self, col: u16, row: u16) -> bool {
+        contains(self.console_area, col, row)
     }
 }
 
@@ -502,7 +509,7 @@ fn handle_mouse(
                 if let Some(i) = launcher.list_hit(m.column, m.row) {
                     launcher.state.select(Some(i));
                     launch_selected(terminal, launcher)?;
-                } else if launcher.on_detail(m.column, m.row) && !launcher.jobs.console_visible {
+                } else if launcher.on_detail(m.column, m.row) {
                     launch_selected(terminal, launcher)?;
                 }
             }
@@ -515,14 +522,14 @@ fn handle_mouse(
                 }
             }
             MouseEventKind::ScrollDown => {
-                if launcher.jobs.console_visible && launcher.on_detail(m.column, m.row) {
+                if launcher.on_console(m.column, m.row) {
                     launcher.jobs.scroll(-3);
                 } else {
                     launcher.move_selection(1);
                 }
             }
             MouseEventKind::ScrollUp => {
-                if launcher.jobs.console_visible && launcher.on_detail(m.column, m.row) {
+                if launcher.on_console(m.column, m.row) {
                     launcher.jobs.scroll(3);
                 } else {
                     launcher.move_selection(-1);
