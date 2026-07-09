@@ -13,14 +13,11 @@
 //! (its transitive workspace-member dependencies) has source newer than the
 //! app's binary — so editing an unrelated crate doesn't mark it stale.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::SystemTime;
-
-use serde::Deserialize;
 
 use crate::cli::Config;
 
@@ -139,199 +136,89 @@ impl fmt::Display for DiscoverError {
     }
 }
 
-// --- cargo metadata JSON (only the fields we use) ------------------------
-
-#[derive(Deserialize)]
-struct Metadata {
-    packages: Vec<Package>,
-    workspace_members: Vec<String>,
-    workspace_root: String,
-    target_directory: String,
-    resolve: Option<Resolve>,
+impl From<portside::Error> for DiscoverError {
+    fn from(e: portside::Error) -> Self {
+        match e {
+            portside::Error::CargoNotFound => DiscoverError::CargoNotFound,
+            portside::Error::NotWorkspace(m) => DiscoverError::NotWorkspace(m),
+            portside::Error::Metadata(m) => DiscoverError::Metadata(m),
+            portside::Error::Parse(m) => DiscoverError::Parse(m),
+        }
+    }
 }
 
-#[derive(Deserialize)]
-struct Package {
-    id: String,
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    manifest_path: String,
-    targets: Vec<MetaTarget>,
-    #[serde(default)]
-    dependencies: Vec<Dependency>,
-}
-
-#[derive(Deserialize)]
-struct MetaTarget {
-    name: String,
-    kind: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct Dependency {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct Resolve {
-    nodes: Vec<Node>,
-}
-
-#[derive(Deserialize)]
-struct Node {
-    id: String,
-    #[serde(default)]
-    deps: Vec<NodeDep>,
-}
-
-#[derive(Deserialize)]
-struct NodeDep {
-    pkg: String,
-    #[serde(default)]
-    dep_kinds: Vec<DepKind>,
-}
-
-#[derive(Deserialize)]
-struct DepKind {
-    #[serde(default)]
-    kind: Option<String>,
-}
-
-/// Run cargo once and build the static catalogue.
+/// Discover the workspace (via `portside`) and build the static catalogue.
 pub fn discover(cfg: &Config) -> Result<Catalog, DiscoverError> {
-    let mut cmd = Command::new("cargo");
-    // No `--no-deps`: we want the resolved graph for per-app freshness.
-    cmd.args(["metadata", "--format-version", "1"]);
-    if let Some(mp) = &cfg.manifest_path {
-        cmd.arg("--manifest-path").arg(mp);
-    }
-    let output = cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            DiscoverError::CargoNotFound
-        } else {
-            DiscoverError::Metadata(e.to_string())
-        }
+    // Load with the resolve graph: we need it for per-app freshness.
+    let ws = portside::load(&portside::LoadOptions {
+        manifest_path: cfg.manifest_path.clone(),
+        resolve: true,
     })?;
-    if !output.status.success() {
-        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(DiscoverError::NotWorkspace(msg));
-    }
-    let meta: Metadata =
-        serde_json::from_slice(&output.stdout).map_err(|e| DiscoverError::Parse(e.to_string()))?;
 
-    let members: HashSet<&str> = meta.workspace_members.iter().map(String::as_str).collect();
-    let root = PathBuf::from(&meta.workspace_root);
-    let target_dir = PathBuf::from(&meta.target_directory);
-    let sub_root = cfg.subfolder.as_ref().map(|s| root.join(s));
+    let sub_root = cfg.subfolder.as_ref().map(|s| ws.root.join(s));
 
-    // Every member's source dir, keyed by id (for the per-member mtime walk).
-    let mut member_dirs = HashMap::new();
-    for p in &meta.packages {
-        if members.contains(p.id.as_str()) {
-            let dir = Path::new(&p.manifest_path)
-                .parent()
-                .unwrap_or(&root)
-                .to_path_buf();
-            member_dirs.insert(p.id.clone(), dir);
+    // Every member's package dir, keyed by id (for the per-member mtime walk).
+    let member_dirs: HashMap<String, PathBuf> = ws
+        .members
+        .iter()
+        .map(|m| (m.id.clone(), m.manifest_dir.clone()))
+        .collect();
+
+    // Member → transitive member-dependency closure (incl. self). Absent only
+    // if cargo didn't return a resolve graph; then freshness over-approximates.
+    let dep_graph = ws
+        .members
+        .first()
+        .is_some_and(|m| ws.linked_members(&m.id).is_some());
+    let mut closures = HashMap::new();
+    if dep_graph {
+        for m in &ws.members {
+            if let Some(closure) = ws.linked_members(&m.id) {
+                closures.insert(m.id.clone(), closure);
+            }
         }
     }
-
-    // Member → transitive member-dependency closure (incl. self).
-    let (closures, dep_graph) = build_closures(&meta.resolve, &members);
 
     let mut metas = Vec::new();
-    for p in &meta.packages {
-        if !members.contains(p.id.as_str()) {
-            continue;
-        }
-        let Some(bin) = p.targets.iter().find(|t| t.kind.iter().any(|k| k == "bin")) else {
+    for m in &ws.members {
+        let Some(bin) = m.bin_target() else {
             continue; // lib-only member — not runnable
         };
-        let dir = &member_dirs[&p.id];
+        let dir = &member_dirs[&m.id];
         if let Some(sr) = &sub_root {
             if !dir.starts_with(sr) {
                 continue;
             }
         }
         if let Some(f) = &cfg.filter {
-            if !p.name.contains(f.as_str()) {
+            if !m.name.contains(f.as_str()) {
                 continue;
             }
         }
-        let kind = if p.dependencies.iter().any(|d| d.name == "bevy") {
+        let kind = if m.has_dependency("bevy") {
             AppKind::Windowed
         } else {
             AppKind::Terminal
         };
         metas.push(AppMeta {
-            id: p.id.clone(),
-            name: p.name.clone(),
+            id: m.id.clone(),
+            name: m.name.clone(),
             bin: bin.name.clone(),
-            description: p.description.clone().unwrap_or_default(),
+            description: m.description.clone().unwrap_or_default(),
             kind,
         });
     }
     metas.sort_by(|a, b| a.name.cmp(&b.name));
 
     Ok(Catalog {
-        root,
-        target_dir,
+        root: ws.root,
+        target_dir: ws.target_dir,
         metas,
         member_dirs,
         closures,
         dep_graph,
         prefer_release: cfg.prefer_release,
     })
-}
-
-/// Build each member's transitive workspace-member dependency set (incl.
-/// itself), skipping dev-only edges (they don't affect the built binary).
-/// Returns `(closures, true)` on success, or `(empty, false)` if the resolve
-/// graph is missing — the caller then over-approximates against all members.
-fn build_closures(
-    resolve: &Option<Resolve>,
-    members: &HashSet<&str>,
-) -> (HashMap<String, HashSet<String>>, bool) {
-    let Some(resolve) = resolve else {
-        return (HashMap::new(), false);
-    };
-
-    // Direct member-dependency edges between workspace members.
-    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
-    for node in &resolve.nodes {
-        if !members.contains(node.id.as_str()) {
-            continue;
-        }
-        let deps = node
-            .deps
-            .iter()
-            .filter(|d| members.contains(d.pkg.as_str()))
-            // Keep a dep unless it is used *only* as a dev-dependency.
-            .filter(|d| {
-                d.dep_kinds.is_empty()
-                    || d.dep_kinds.iter().any(|k| k.kind.as_deref() != Some("dev"))
-            })
-            .map(|d| d.pkg.as_str())
-            .collect();
-        edges.insert(node.id.as_str(), deps);
-    }
-
-    let mut closures = HashMap::new();
-    for &start in members {
-        let mut seen = HashSet::new();
-        let mut queue = VecDeque::from([start]);
-        while let Some(id) = queue.pop_front() {
-            if !seen.insert(id.to_string()) {
-                continue;
-            }
-            if let Some(neighbours) = edges.get(id) {
-                queue.extend(neighbours.iter().copied());
-            }
-        }
-        closures.insert(start.to_string(), seen);
-    }
-    (closures, true)
 }
 
 /// Filesystem-only pass: resolve each app's prebuilt binaries and freshness.

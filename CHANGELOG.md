@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-09
+
+### Updates
+
+- Update cargo-bay to discover the workspace via the shared portside core
+
+Replace the hand-rolled `cargo metadata` parsing and dependency-graph closure
+walk in discover.rs with the published `portside` crate, dropping the serde /
+serde_json dependencies. Freshness, prebuilt lookup, and the windowed/terminal
+split are unchanged — only the discovery half moved to the shared core.
+
 ## [0.2.0] - 2026-07-08
 
 ### Features
